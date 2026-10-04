@@ -1,0 +1,6 @@
+{
+  "name": "Kūbuku · Student Food Platform",
+  "description": "Production-ready campus food intelligence platform with budget survival mode, CP-value satiety solver, nutrition tracking, and student secret hacks powered by FastAPI and SQLite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
