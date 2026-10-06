@@ -1,5 +1,6 @@
 export interface FoodItem {
-  id: number;
+  id: number | string;
+  doc_id?: string;
   store_name: string;
   store_name_english?: string;
   location: string;
@@ -26,7 +27,7 @@ export interface FoodItem {
 }
 
 export interface SurvivalComboItem {
-  id: number;
+  id: number | string;
   dish_name: string;
   english_name?: string;
   store_name: string;

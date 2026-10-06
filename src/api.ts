@@ -762,12 +762,12 @@ export async function fetchPlatformStats(): Promise<PlatformStats> {
   } catch {
     return {
       total_dishes: FALLBACK_FOODS.length,
-      avg_price: 2.12,
-      min_price: 0.65,
-      max_price: 3.80,
+      avg_price: 60.00,
+      min_price: 15.00,
+      max_price: 110.00,
       avg_calories: 569.5,
       highest_cp_dish: "特大筍香鮮肉包 2入",
-      highest_cp_value: 436.4,
+      highest_cp_value: 14.5,
       vegetarian_count: 4,
       hacks_count: FALLBACK_HACKS.length,
       cuisines: ["Taiwanese", "Japanese", "Vegetarian", "Hong Kong", "Beverage"],

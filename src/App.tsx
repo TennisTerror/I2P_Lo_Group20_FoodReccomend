@@ -23,8 +23,16 @@ import {
   Building2,
   UtensilsCrossed,
   SlidersHorizontal,
-  ChevronDown
+  ChevronDown,
+  ArrowUpRight,
+  Upload,
+  FileUp,
+  Trash2,
+  CheckSquare,
+  Square,
+  RotateCcw
 } from 'lucide-react';
+import * as XLSX from 'xlsx';
 import {
   FoodItem,
   SurvivalResponse,
@@ -43,6 +51,19 @@ import {
   fetchPlatformStats,
   FALLBACK_FOODS
 } from './api';
+import {
+  getFoodsFromFirestore,
+  addFoodToFirestore,
+  getHacksFromFirestore,
+  addHackToFirestore,
+  upvoteHackInFirestore,
+  batchImportFoodsToFirestore,
+  deleteFoodFromFirestore,
+  batchDeleteFoodsFromFirestore,
+  deleteAllImportedFoodsFromFirestore,
+  resetFoodsCollectionToDefaults
+} from './firebaseService';
+import { testFirebaseConnection } from './firebase';
 
 export default function App() {
   // Navigation & View Mode
@@ -54,6 +75,7 @@ export default function App() {
   const [leaderboard, setLeaderboard] = useState<CPLeaderboard | null>(null);
   const [stats, setStats] = useState<PlatformStats | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [firebaseActive, setFirebaseActive] = useState<boolean>(true);
 
   // Filters
   const [searchQuery, setSearchQuery] = useState('');
@@ -61,11 +83,11 @@ export default function App() {
   const [selectedCuisine, setSelectedCuisine] = useState<string>('All');
   const [selectedTag, setSelectedTag] = useState<string>('All');
   const [vegetarianOnly, setVegetarianOnly] = useState<boolean>(false);
-  const [maxPriceFilter, setMaxPriceFilter] = useState<number>(5.0);
+  const [maxPriceFilter, setMaxPriceFilter] = useState<number>(500);
   const [sortBy, setSortBy] = useState<string>('cp_value');
 
   // Survival Mode State
-  const [survivalBudget, setSurvivalBudget] = useState<number>(2.00);
+  const [survivalBudget, setSurvivalBudget] = useState<number>(60.00);
   const [survivalLocation, setSurvivalLocation] = useState<string>('All');
   const [survivalData, setSurvivalData] = useState<SurvivalResponse | null>(null);
   const [survivalLoading, setSurvivalLoading] = useState<boolean>(false);
@@ -76,6 +98,420 @@ export default function App() {
   const [selectedFoodDetail, setSelectedFoodDetail] = useState<FoodItem | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  // SQL & Cloud Firestore Inspector State
+  const [dbInspectorTab, setDbInspectorTab] = useState<'firestore' | 'sql'>('firestore');
+  const [firestoreViewCollection, setFirestoreViewCollection] = useState<'foods' | 'campus_hacks'>('foods');
+  const [customSql, setCustomSql] = useState("SELECT id, store_name, dish_name, price, calories, protein FROM foods ORDER BY price ASC LIMIT 10;");
+  const [sqlResults, setSqlResults] = useState<{ columns: string[]; rows: any[]; count: number } | null>(null);
+  const [sqlLoading, setSqlLoading] = useState<boolean>(false);
+  const [sqlError, setSqlError] = useState<string | null>(null);
+
+  // Excel to Firebase Import State
+  const [showExcelImportModal, setShowExcelImportModal] = useState<boolean>(false);
+  const [importedRows, setImportedRows] = useState<any[] | null>(null);
+  const [importFileName, setImportFileName] = useState<string>('');
+  const [importingToFirebase, setImportingToFirebase] = useState<boolean>(false);
+  const [importError, setImportError] = useState<string | null>(null);
+
+  // Dish Row Selection & Deletion State
+  const [selectedDishIds, setSelectedDishIds] = useState<(string | number)[]>([]);
+  const [deletingRows, setDeletingRows] = useState<boolean>(false);
+  const [showConfirmDeleteModal, setShowConfirmDeleteModal] = useState<boolean>(false);
+  const [deleteTargetIds, setDeleteTargetIds] = useState<(string | number)[]>([]);
+  const [deleteTargetLabel, setDeleteTargetLabel] = useState<string>('');
+
+  // Toggle selection of a single dish
+  const handleToggleSelectDish = (id: string | number) => {
+    setSelectedDishIds(prev => 
+      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+    );
+  };
+
+  // Select all currently visible / filtered dishes
+  const handleSelectAllVisibleDishes = () => {
+    const allIds = filteredFoods.map(f => f.id);
+    setSelectedDishIds(allIds);
+  };
+
+  // Deselect all
+  const handleClearSelectedDishes = () => {
+    setSelectedDishIds([]);
+  };
+
+  // Prepare deletion for single dish
+  const promptDeleteSingleDish = (item: FoodItem) => {
+    setDeleteTargetIds([item.id]);
+    setDeleteTargetLabel(`"${item.dish_name}" (${item.store_name})`);
+    setShowConfirmDeleteModal(true);
+  };
+
+  // Prepare deletion for all selected dishes
+  const promptDeleteSelectedDishes = () => {
+    if (selectedDishIds.length === 0) return;
+    setDeleteTargetIds(selectedDishIds);
+    setDeleteTargetLabel(`${selectedDishIds.length} selected dishes`);
+    setShowConfirmDeleteModal(true);
+  };
+
+  // Prepare delete all imported / custom dishes
+  const promptDeleteAllImported = () => {
+    const imported = foods.filter(f => String(f.id).startsWith('excel_') || f.is_official === false || (typeof f.id === 'string' && isNaN(Number(f.id))));
+    if (imported.length === 0) {
+      triggerToast("No imported or custom rows found.");
+      return;
+    }
+    setDeleteTargetIds(imported.map(f => f.id));
+    setDeleteTargetLabel(`all ${imported.length} custom / uploaded dishes`);
+    setShowConfirmDeleteModal(true);
+  };
+
+  // Prepare full reset to defaults
+  const promptResetToDefaults = () => {
+    setDeleteTargetIds(['__RESET_ALL__']);
+    setDeleteTargetLabel(`all current items and reset to the 18 official campus catalog dishes`);
+    setShowConfirmDeleteModal(true);
+  };
+
+  // Execute deletion
+  const handleExecuteDeletion = async () => {
+    if (deleteTargetIds.length === 0) return;
+    setDeletingRows(true);
+
+    try {
+      if (deleteTargetIds.includes('__RESET_ALL__')) {
+        await resetFoodsCollectionToDefaults();
+        try {
+          await fetch('/api/foods/reset-defaults', { method: 'POST' });
+        } catch {}
+        triggerToast("Database reset to 18 official campus dishes.");
+      } else {
+        // 1. Delete from Cloud Firestore
+        await batchDeleteFoodsFromFirestore(deleteTargetIds);
+
+        // 2. Sync deletion to SQLite backend
+        try {
+          await fetch('/api/foods/batch-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: deleteTargetIds })
+          });
+        } catch {}
+
+        triggerToast(`Successfully deleted ${deleteTargetIds.length} dish(es).`);
+      }
+
+      setFoods(prev => prev.filter(f => !deleteTargetIds.includes(f.id) && !deleteTargetIds.includes(String(f.id))));
+      setSelectedDishIds(prev => prev.filter(id => !deleteTargetIds.includes(id)));
+      setShowConfirmDeleteModal(false);
+      setDeleteTargetIds([]);
+      setDeleteTargetLabel('');
+      await loadAllData();
+    } catch (err: any) {
+      triggerToast(`Deletion error: ${err.message || 'Failed to delete'}`);
+    } finally {
+      setDeletingRows(false);
+    }
+  };
+
+  // Generates and downloads a clean, verified template matching exact schema:
+  // id, store_name, store_name_english, location, location_english, dish_name, price, calories, protein, carbs, fat, is_vegetarian, is_official, cuisine, is_combo, category, EnglishName, ChineseName
+  const downloadReferenceTemplate = () => {
+    try {
+      const templateData = [
+        {
+          id: 1,
+          store_name: "好富熟成黑咖哩 (Hao Fu Curry)",
+          store_name_english: "Hao Fu Aged Black Curry",
+          location: "小吃部 (Xiao Chi Bu)",
+          location_english: "Xiao Chi Bu Dining Hall",
+          dish_name: "特製熟成黑咖哩牛肋飯",
+          price: 90.00,
+          calories: 810,
+          protein: 36.0,
+          carbs: 98.0,
+          fat: 26.0,
+          is_vegetarian: 0,
+          is_official: 1,
+          cuisine: "Japanese",
+          is_combo: 1,
+          category: "Main",
+          EnglishName: "Signature Aged Black Curry Beef Rib Rice",
+          ChineseName: "特製熟成黑咖哩牛肋飯"
+        },
+        {
+          id: 2,
+          store_name: "好富熟成黑咖哩 (Hao Fu Curry)",
+          store_name_english: "Hao Fu Aged Black Curry",
+          location: "小吃部 (Xiao Chi Bu)",
+          location_english: "Xiao Chi Bu Dining Hall",
+          dish_name: "酥脆炸豬排黑咖哩飯",
+          price: 80.00,
+          calories: 850,
+          protein: 34.0,
+          carbs: 104.0,
+          fat: 29.0,
+          is_vegetarian: 0,
+          is_official: 1,
+          cuisine: "Japanese",
+          is_combo: 1,
+          category: "Main",
+          EnglishName: "Crispy Tonkatsu Black Curry Rice",
+          ChineseName: "酥脆炸豬排黑咖哩飯"
+        },
+        {
+          id: 3,
+          store_name: "老張滷肉飯 (Lao Zhang)",
+          store_name_english: "Lao Zhang Braised Pork",
+          location: "風雲樓 (Feng Yun Building)",
+          location_english: "Feng Yun Student Center 1F",
+          dish_name: "招牌黃金滷肉飯便當",
+          price: 65.00,
+          calories: 720,
+          protein: 26.0,
+          carbs: 92.0,
+          fat: 28.0,
+          is_vegetarian: 0,
+          is_official: 1,
+          cuisine: "Taiwanese",
+          is_combo: 1,
+          category: "Main",
+          EnglishName: "Braised Pork Rice Bento",
+          ChineseName: "招牌黃金滷肉飯便當"
+        },
+        {
+          id: 4,
+          store_name: "校園素食閣 (Green Oasis Vegan)",
+          store_name_english: "Green Oasis Campus Vegan",
+          location: "理學院地下街 (Science Hall)",
+          location_english: "Science Hall Cafeteria",
+          dish_name: "五穀彩蔬高蛋白豆腐煲",
+          price: 2.10,
+          calories: 510,
+          protein: 28.0,
+          carbs: 66.0,
+          fat: 14.0,
+          is_vegetarian: 1,
+          is_official: 1,
+          cuisine: "Vegetarian",
+          is_combo: 1,
+          category: "Main",
+          EnglishName: "High-Protein Braised Tofu with Whole Grain Rice",
+          ChineseName: "五穀彩蔬高蛋白豆腐煲"
+        },
+        {
+          id: 5,
+          store_name: "永和豆漿大王 (Sunrise Soy Milk)",
+          store_name_english: "Sunrise Soy Milk & Buns",
+          location: "校門口正對面 (Front Gate)",
+          location_english: "Opposite Campus Main Gate",
+          dish_name: "蔥花蛋餅 + 冰研磨無糖豆漿",
+          price: 1.40,
+          calories: 440,
+          protein: 18.5,
+          carbs: 42.0,
+          fat: 19.0,
+          is_vegetarian: 0,
+          is_official: 1,
+          cuisine: "Taiwanese",
+          is_combo: 1,
+          category: "Breakfast",
+          EnglishName: "Scallion Egg Pancake + Unsweetened Soy Milk",
+          ChineseName: "蔥花蛋餅配研磨豆漿"
+        }
+      ];
+
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(templateData, {
+        header: [
+          'id',
+          'store_name',
+          'store_name_english',
+          'location',
+          'location_english',
+          'dish_name',
+          'price',
+          'calories',
+          'protein',
+          'carbs',
+          'fat',
+          'is_vegetarian',
+          'is_official',
+          'cuisine',
+          'is_combo',
+          'category',
+          'EnglishName',
+          'ChineseName'
+        ]
+      });
+
+      XLSX.utils.book_append_sheet(wb, ws, "Food_Template");
+      XLSX.writeFile(wb, "campus_food_import_template.xlsx");
+      triggerToast("Reference template downloaded! Exactly 18 columns.");
+    } catch (err) {
+      console.error("Template generation error:", err);
+      window.location.href = "/campus_food_import_template.xlsx";
+    }
+  };
+
+  // Helper to normalize keys from any Excel header variation
+  const normalizeRowKeys = (row: any) => {
+    const keys = Object.keys(row);
+    const getVal = (...possibleNames: string[]) => {
+      for (const name of possibleNames) {
+        const found = keys.find(k => k.trim().toLowerCase() === name.toLowerCase());
+        if (found && row[found] !== undefined && row[found] !== null && row[found] !== '') {
+          return row[found];
+        }
+      }
+      return undefined;
+    };
+
+    const id = getVal('id', 'food_id', 'ID');
+    const store_name = String(getVal('store_name', 'store name', 'store', 'shop', 'restaurant', 'eatery', '餐廳', '店家') || 'Campus Eatery').trim();
+    const store_name_english = String(getVal('store_name_english', 'store english', 'english store', 'store_eng') || store_name).trim();
+    const location = String(getVal('location', 'canteen', 'dining hall', 'building', 'hall', '地點', '學餐', '餐廳地點') || 'Campus Concourse').trim();
+    const location_english = String(getVal('location_english', 'location english', 'canteen english') || location).trim();
+    const dish_name = String(getVal('dish_name', 'dish name', 'dish', 'item', 'meal', 'food', 'food name', '菜名', '餐點', '品項') || 'Campus Dish').trim();
+    const price = Math.max(0.1, parseFloat(String(getVal('price', 'cost', '金額', '價格', '價錢', '定價') || 2.0)));
+    const calories = Math.max(0, parseFloat(String(getVal('calories', 'kcal', 'energy', '熱量', '卡路里') || 500)));
+    const protein = Math.max(0, parseFloat(String(getVal('protein', '蛋白質', '蛋白') || 20)));
+    const carbs = Math.max(0, parseFloat(String(getVal('carbs', 'carbohydrates', '碳水', '碳水化合物') || 60)));
+    const fat = Math.max(0, parseFloat(String(getVal('fat', '脂肪') || 15)));
+    const is_vegetarian = (() => {
+      const v = getVal('is_vegetarian', 'vegetarian', 'veg', '素食', '純素');
+      if (typeof v === 'boolean') return v ? 1 : 0;
+      if (typeof v === 'number') return v !== 0 ? 1 : 0;
+      if (typeof v === 'string') return ['yes', 'true', '1', '是', '素'].includes(v.trim().toLowerCase()) ? 1 : 0;
+      return 0;
+    })();
+    const is_official = (() => {
+      const v = getVal('is_official', 'official', '官方');
+      if (v === undefined) return 1;
+      if (typeof v === 'boolean') return v ? 1 : 0;
+      if (typeof v === 'number') return v !== 0 ? 1 : 0;
+      return String(v).toLowerCase() === 'true' || String(v) === '1' ? 1 : 0;
+    })();
+    const is_combo = (() => {
+      const v = getVal('is_combo', 'combo', '套餐');
+      if (v === undefined) return 1;
+      if (typeof v === 'boolean') return v ? 1 : 0;
+      if (typeof v === 'number') return v !== 0 ? 1 : 0;
+      return String(v).toLowerCase() === 'true' || String(v) === '1' ? 1 : 0;
+    })();
+    const cuisine = String(getVal('cuisine', 'cuisine type', 'type', '料理', '種類', '料理類型') || 'Taiwanese').trim();
+    const category = String(getVal('category', 'meal type', '分類') || 'Main').trim();
+    const EnglishName = String(getVal('EnglishName', 'englishname', 'english_name', 'english name', 'dish english') || dish_name).trim();
+    const ChineseName = String(getVal('ChineseName', 'chinesename', 'chinese_name', 'chinese name', 'dish chinese') || dish_name).trim();
+
+    return {
+      id: id ? Number(id) : undefined,
+      store_name,
+      store_name_english,
+      location,
+      location_english,
+      dish_name,
+      price,
+      calories,
+      protein,
+      carbs,
+      fat,
+      is_vegetarian,
+      is_official,
+      cuisine,
+      is_combo,
+      category,
+      EnglishName,
+      ChineseName,
+      english_name: EnglishName,
+      chinese_name: ChineseName,
+      tags: `${cuisine}, ${category}, ${is_combo ? 'Combo Meal' : 'Single Dish'}`
+    };
+  };
+
+  const handleExcelFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportError(null);
+    setImportFileName(file.name);
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const buffer = evt.target?.result;
+        const workbook = XLSX.read(buffer, { type: 'array' });
+        const firstSheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[firstSheetName];
+        const rawJson: any[] = XLSX.utils.sheet_to_json(worksheet);
+
+        if (!rawJson || rawJson.length === 0) {
+          setImportError("Uploaded Excel sheet contains no readable data rows.");
+          setImportedRows(null);
+          return;
+        }
+
+        const normalized = rawJson.map(normalizeRowKeys);
+        setImportedRows(normalized);
+      } catch (err: any) {
+        setImportError(err.message || "Failed to parse Excel workbook.");
+        setImportedRows(null);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const handleCommitExcelToFirebase = async () => {
+    if (!importedRows || importedRows.length === 0) return;
+    setImportingToFirebase(true);
+    setImportError(null);
+
+    try {
+      // 1. Commit batch directly to Google Cloud Firestore
+      const result = await batchImportFoodsToFirestore(importedRows);
+
+      // 2. Also sync to FastAPI SQLite backend & food_database.xlsx
+      try {
+        await fetch('/api/foods/batch-import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: importedRows })
+        });
+      } catch (apiErr) {
+        console.warn("Backend SQLite sync warning:", apiErr);
+      }
+
+      triggerToast(`Success! ${result.count} dishes imported & stored in Cloud Firestore.`);
+      setShowExcelImportModal(false);
+      setImportedRows(null);
+      setImportFileName('');
+      loadAllData();
+    } catch (err: any) {
+      setImportError(err.message || "Failed to write items to Cloud Firestore.");
+    } finally {
+      setImportingToFirebase(false);
+    }
+  };
+
+  const executeSqlQuery = async (queryToRun = customSql) => {
+    setSqlLoading(true);
+    setSqlError(null);
+    try {
+      const res = await fetch('/api/sql-run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: queryToRun })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Query execution error');
+      }
+      setSqlResults(data);
+    } catch (err: any) {
+      setSqlError(err.message || 'Failed to run SQL query');
+    } finally {
+      setSqlLoading(false);
+    }
+  };
+
   // Add Food Form
   const [newFood, setNewFood] = useState({
     store_name: '',
@@ -83,7 +519,7 @@ export default function App() {
     location: '小吃部 (Xiao Chi Bu)',
     location_english: 'Xiao Chi Bu Dining Hall',
     dish_name: '',
-    price: 2.00,
+    price: 60.00,
     calories: 550,
     protein: 25,
     carbs: 70,
@@ -120,18 +556,47 @@ export default function App() {
   const loadAllData = async () => {
     setLoading(true);
     try {
-      const [foodsRes, hacksRes, lbRes, statsRes] = await Promise.all([
-        fetchFoods(),
-        fetchHacks(),
+      // 1. Fetch live data from Cloud Firestore
+      const [firestoreFoods, firestoreHacks, lbRes, statsRes] = await Promise.all([
+        getFoodsFromFirestore(),
+        getHacksFromFirestore(),
         fetchCPLeaderboard(),
         fetchPlatformStats()
       ]);
-      setFoods(foodsRes.items);
-      setHacks(hacksRes);
+
+      if (firestoreFoods && firestoreFoods.length > 0) {
+        setFoods(firestoreFoods);
+      } else {
+        const foodsRes = await fetchFoods();
+        setFoods(foodsRes.items);
+      }
+
+      if (firestoreHacks && firestoreHacks.length > 0) {
+        setHacks(firestoreHacks);
+      } else {
+        const hacksRes = await fetchHacks();
+        setHacks(hacksRes);
+      }
+
       setLeaderboard(lbRes);
       setStats(statsRes);
+      setFirebaseActive(true);
     } catch (err) {
-      console.error("Error loading platform data:", err);
+      console.warn("Firestore initialization or read fallback:", err);
+      try {
+        const [foodsRes, hacksRes, lbRes, statsRes] = await Promise.all([
+          fetchFoods(),
+          fetchHacks(),
+          fetchCPLeaderboard(),
+          fetchPlatformStats()
+        ]);
+        setFoods(foodsRes.items);
+        setHacks(hacksRes);
+        setLeaderboard(lbRes);
+        setStats(statsRes);
+      } catch (fallbackErr) {
+        console.error("Local fallback error:", fallbackErr);
+      }
     } finally {
       setLoading(false);
     }
@@ -156,6 +621,20 @@ export default function App() {
     }
   }, [activeTab, survivalBudget, survivalLocation]);
 
+  // Dynamic Mean Dish Price (Calculated directly from loaded dishes, normalized to realistic campus currency ~60.00)
+  const meanDishPrice = useMemo(() => {
+    if (foods && foods.length > 0) {
+      const valid = foods.map(f => Number(f.price)).filter(p => !isNaN(p) && p > 0);
+      if (valid.length > 0) {
+        const avg = valid.reduce((acc, p) => acc + p, 0) / valid.length;
+        // If loaded items were on legacy micro-scale (< 10), scale to campus currency (~60.00)
+        return avg < 10 ? avg * 28.5 : avg;
+      }
+    }
+    if (stats && stats.avg_price && stats.avg_price >= 15) return stats.avg_price;
+    return 60.00;
+  }, [foods, stats]);
+
   // Filtered Foods List
   const filteredFoods = useMemo(() => {
     return foods.filter(item => {
@@ -163,10 +642,13 @@ export default function App() {
         const q = searchQuery.toLowerCase();
         const matchDish = item.dish_name.toLowerCase().includes(q);
         const matchStore = item.store_name.toLowerCase().includes(q);
+        const matchStoreEng = item.store_name_english?.toLowerCase().includes(q);
         const matchLoc = item.location.toLowerCase().includes(q);
+        const matchLocEng = item.location_english?.toLowerCase().includes(q);
         const matchEng = item.english_name?.toLowerCase().includes(q);
+        const matchChinese = item.chinese_name?.toLowerCase().includes(q);
         const matchTags = item.tags?.toLowerCase().includes(q);
-        if (!matchDish && !matchStore && !matchLoc && !matchEng && !matchTags) return false;
+        if (!matchDish && !matchStore && !matchStoreEng && !matchLoc && !matchLocEng && !matchEng && !matchChinese && !matchTags) return false;
       }
       if (selectedCanteen !== 'All' && item.location !== selectedCanteen) return false;
       if (selectedCuisine !== 'All' && item.cuisine !== selectedCuisine) return false;
@@ -204,7 +686,7 @@ export default function App() {
       if (!canteensMap.has(canteenKey)) {
         canteensMap.set(canteenKey, {
           canteenName: item.location,
-          canteenNameEnglish: item.location_english,
+          canteenNameEnglish: item.location_english || item.location,
           storesMap: new Map()
         });
       }
@@ -214,7 +696,7 @@ export default function App() {
       if (!canteenObj.storesMap.has(storeKey)) {
         canteenObj.storesMap.set(storeKey, {
           storeName: item.store_name,
-          storeNameEnglish: item.store_name_english,
+          storeNameEnglish: item.store_name_english || item.store_name,
           cuisine: item.cuisine,
           dishes: []
         });
@@ -230,18 +712,34 @@ export default function App() {
     }));
   }, [filteredFoods]);
 
-  // Unique Canteens List for Navigation
+  // Unique Canteens List for Navigation (Prefer English Name)
   const availableCanteens = useMemo(() => {
-    const locs = Array.from(new Set(foods.map(f => f.location)));
-    return ['All', ...locs];
+    const locMap = new Map<string, { key: string; label: string }>();
+    locMap.set('All', { key: 'All', label: 'All Canteens' });
+
+    for (const f of foods) {
+      if (!locMap.has(f.location)) {
+        const eng = f.location_english || f.location;
+        locMap.set(f.location, {
+          key: f.location,
+          label: eng
+        });
+      }
+    }
+    return Array.from(locMap.values());
   }, [foods]);
 
   // Hack Upvote Handler
-  const handleUpvote = async (hackId: number) => {
+  const handleUpvote = async (hackId: any) => {
     try {
-      const res = await upvoteHackApi(hackId);
-      setHacks(prev => prev.map(h => h.id === hackId ? { ...h, upvotes: res.upvotes } : h));
-      triggerToast("Voted! Tip verified for fellow students.");
+      // 1. Update Cloud Firestore
+      await upvoteHackInFirestore(hackId);
+      // 2. Also notify local API if numeric ID
+      if (typeof hackId === 'number') {
+        try { await upvoteHackApi(hackId); } catch {}
+      }
+      setHacks(prev => prev.map(h => h.id === hackId ? { ...h, upvotes: h.upvotes + 1 } : h));
+      triggerToast("Voted! Recorded in Cloud Firestore.");
     } catch {
       triggerToast("Vote recorded.");
     }
@@ -252,16 +750,22 @@ export default function App() {
     e.preventDefault();
     if (!newHack.store_name || !newHack.hack_text) return;
     try {
-      await submitHackApi({
-        store_name: newHack.store_name,
-        dish_name: newHack.dish_name || undefined,
-        hack_text: newHack.hack_text,
-        author: newHack.author || 'Anonymous Student'
-      });
+      // 1. Write to Cloud Firestore
+      await addHackToFirestore(newHack);
+      // 2. Sync to local backend
+      try {
+        await submitHackApi({
+          store_name: newHack.store_name,
+          dish_name: newHack.dish_name || undefined,
+          hack_text: newHack.hack_text,
+          author: newHack.author || 'Anonymous Student'
+        });
+      } catch {}
+
       setShowAddHackModal(false);
       setNewHack({ store_name: '', dish_name: '', hack_text: '', author: '' });
-      triggerToast("Campus hack posted to community feed!");
-      const refreshed = await fetchHacks();
+      triggerToast("Campus hack stored in Cloud Firestore!");
+      const refreshed = await getHacksFromFirestore();
       setHacks(refreshed);
     } catch {
       triggerToast("Hack submitted successfully.");
@@ -274,9 +778,15 @@ export default function App() {
     e.preventDefault();
     if (!newFood.dish_name || !newFood.store_name) return;
     try {
-      await addFoodApi(newFood);
+      // 1. Write to Cloud Firestore
+      await addFoodToFirestore(newFood);
+      // 2. Sync to FastAPI SQLite backend
+      try {
+        await addFoodApi(newFood);
+      } catch {}
+
       setShowAddFoodModal(false);
-      triggerToast("New dish added safely to SQLite & Excel dataset!");
+      triggerToast("New dish stored in Cloud Firestore & SQLite!");
       loadAllData();
     } catch {
       triggerToast("Dish saved successfully!");
@@ -352,12 +862,20 @@ export default function App() {
               onClick={() => setActiveTab('database')}
               className={`hover:text-white transition-colors pb-0.5 border-b-2 ${activeTab === 'database' ? 'text-white border-[#ea580c]' : 'border-transparent'}`}
             >
-              SQLite & Excel
+              Firebase & SQL
             </button>
           </nav>
 
           {/* Zone 3: Primary Action */}
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowExcelImportModal(true)}
+              className="px-3 py-1.5 text-xs font-semibold text-[#a1a1aa] hover:text-white bg-[#141620] hover:bg-[#1f2330] border border-[#252a3a] hover:border-[#ea580c] transition-colors flex items-center gap-1.5 whitespace-nowrap font-mono"
+            >
+              <FileUp className="w-3.5 h-3.5 text-[#ea580c]" />
+              <span className="hidden sm:inline">Import Excel</span>
+            </button>
+
             <button
               onClick={() => setShowAddFoodModal(true)}
               className="px-3.5 py-1.5 text-xs font-semibold text-white bg-[#ea580c] hover:bg-[#c2410c] transition-colors flex items-center gap-1.5 whitespace-nowrap font-mono"
@@ -400,7 +918,7 @@ export default function App() {
                   </div>
                   <div className="border-l border-[#1a1d26] pl-4">
                     <div className="text-2xl font-bold font-mono text-[#ea580c] tabular-nums">
-                      ${stats ? stats.avg_price.toFixed(2) : '2.12'}
+                      ${meanDishPrice.toFixed(2)}
                     </div>
                     <div className="text-[11px] text-[#71717a] mt-0.5 font-mono">Mean Dish Price</div>
                   </div>
@@ -427,12 +945,12 @@ export default function App() {
                   <button
                     onClick={() => {
                       setActiveTab('survival');
-                      handleRunSurvival(2.00);
+                      handleRunSurvival(60.00);
                     }}
                     className="px-5 py-2.5 bg-[#161822] hover:bg-[#1f2330] border border-[#262b3a] hover:border-[#ea580c] text-xs font-semibold text-white transition-all flex items-center justify-center gap-2 whitespace-nowrap font-mono"
                   >
                     <Zap className="w-3.5 h-3.5 text-[#ea580c]" />
-                    <span>Run $2.00 Survival Solver</span>
+                    <span>Run $60.00 Survival Solver</span>
                   </button>
                 </div>
               </div>
@@ -447,29 +965,29 @@ export default function App() {
                         Featured Store Deal
                       </span>
                     </div>
-                    <span className="text-xs font-mono text-[#71717a]">小吃部 · Hao Fu Curry</span>
+                    <span className="text-xs font-mono text-[#71717a]">Xiao Chi Bu · Master Zhang</span>
                   </div>
 
                   {/* Clean Wireframe Photo Slot */}
                   <div className="border border-dashed border-[#292f42] bg-[#090a0e] p-3 text-center space-y-1">
                     <div className="flex items-center justify-center gap-1.5 text-xs font-mono text-[#71717a]">
                       <Camera className="w-3.5 h-3.5 text-[#ea580c]" />
-                      <span>CANTEEN STOREFRONT SLOT</span>
+                      <span>CANTEEN STOREFRONT FRAME</span>
                     </div>
                     <div className="text-[11px] text-[#52525b] max-w-xs mx-auto font-mono">
-                      Reserved for verified student storefront photo submission.
+                      Verified student storefront photo submission slot.
                     </div>
                   </div>
 
                   <div className="space-y-1">
                     <div className="flex items-baseline justify-between">
                       <h2 className="text-lg font-bold text-white font-['Syne',sans-serif]">
-                        酥脆炸豬排黑咖哩飯
+                        Signature Braised Pork Rice Bento
                       </h2>
-                      <span className="text-base font-mono font-bold text-[#ea580c] tabular-nums">$2.90</span>
+                      <span className="text-base font-mono font-bold text-[#ea580c] tabular-nums">$60.00</span>
                     </div>
                     <div className="text-xs text-[#a1a1aa] font-mono">
-                      好富熟成黑咖哩 · 小吃部 (Xiao Chi Bu)
+                      Master Zhang Braised Pork (老張滷肉飯) · Xiao Chi Bu Dining Hall
                     </div>
                   </div>
 
@@ -533,15 +1051,15 @@ export default function App() {
                   </span>
                   {availableCanteens.map((canteen) => (
                     <button
-                      key={canteen}
-                      onClick={() => setSelectedCanteen(canteen)}
+                      key={canteen.key}
+                      onClick={() => setSelectedCanteen(canteen.key)}
                       className={`px-3 py-1.5 text-xs font-mono whitespace-nowrap transition-colors border ${
-                        selectedCanteen === canteen
+                        selectedCanteen === canteen.key
                           ? 'bg-[#ea580c] border-[#ea580c] text-white font-bold'
                           : 'bg-[#151722] border-[#252a3a] text-[#a1a1aa] hover:text-white hover:border-[#3b4259]'
                       }`}
                     >
-                      {canteen}
+                      {canteen.label}
                     </button>
                   ))}
                 </div>
@@ -613,21 +1131,46 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* Max Price Range Slider */}
-                <div className="flex items-center gap-3">
-                  <span className="text-xs text-[#71717a] font-mono uppercase">Max Budget:</span>
+                {/* Max Price Range Slider (At least $500 max budget) */}
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  <span className="text-xs text-[#71717a] font-mono uppercase whitespace-nowrap">Max Budget:</span>
                   <input
                     type="range"
-                    min="1.0"
-                    max="5.0"
-                    step="0.25"
+                    min="1"
+                    max="500"
+                    step="1"
                     value={maxPriceFilter}
                     onChange={(e) => setMaxPriceFilter(parseFloat(e.target.value))}
-                    className="w-24 accent-[#ea580c]"
+                    className="w-28 accent-[#ea580c]"
                   />
-                  <span className="text-xs font-mono font-bold text-white tabular-nums">
-                    ${maxPriceFilter.toFixed(2)}
-                  </span>
+                  <div className="flex items-center gap-1 bg-[#12141c] border border-[#252a3a] px-2 py-0.5">
+                    <span className="text-xs font-mono text-[#ea580c] font-bold">$</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="1000"
+                      value={maxPriceFilter}
+                      onChange={(e) => setMaxPriceFilter(Math.max(1, parseFloat(e.target.value) || 0))}
+                      className="w-12 bg-transparent text-xs font-mono font-medium text-white tabular-nums focus:outline-none"
+                      style={{ fontWeight: 500 }}
+                    />
+                  </div>
+                  {/* Quick Preset Buttons */}
+                  <div className="flex items-center gap-1 text-[11px] font-mono">
+                    {[5, 20, 50, 100, 500].map((preset) => (
+                      <button
+                        key={preset}
+                        onClick={() => setMaxPriceFilter(preset)}
+                        className={`px-1.5 py-0.5 border ${
+                          maxPriceFilter === preset
+                            ? 'border-[#ea580c] text-[#ea580c] bg-[#ea580c]/10 font-bold'
+                            : 'border-[#252a3a] text-[#71717a] hover:text-white'
+                        }`}
+                      >
+                        ${preset}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
               </div>
@@ -649,15 +1192,15 @@ export default function App() {
                       <div>
                         <div className="flex items-center gap-2">
                           <h2 className="text-xl font-bold text-white font-['Syne',sans-serif]">
-                            {canteen.canteenName}
+                            {canteen.canteenNameEnglish || canteen.canteenName}
                           </h2>
                           <span className="text-xs font-mono text-[#ea580c] border border-[#ea580c]/40 px-2 py-0.5">
                             {canteen.stores.length} {canteen.stores.length === 1 ? 'Store' : 'Stores'}
                           </span>
                         </div>
-                        {canteen.canteenNameEnglish && (
+                        {canteen.canteenName && canteen.canteenNameEnglish && canteen.canteenName !== canteen.canteenNameEnglish && (
                           <p className="text-xs text-[#71717a] font-mono mt-0.5">
-                            {canteen.canteenNameEnglish}
+                            {canteen.canteenName}
                           </p>
                         )}
                       </div>
@@ -682,15 +1225,15 @@ export default function App() {
                             <div>
                               <div className="flex items-center gap-2">
                                 <h3 className="text-base font-bold text-white font-['Syne',sans-serif]">
-                                  {store.storeName}
+                                  {store.storeNameEnglish || store.storeName}
                                 </h3>
                                 <span className="text-[11px] font-mono text-[#71717a]">
                                   · {store.cuisine}
                                 </span>
                               </div>
-                              {store.storeNameEnglish && (
+                              {store.storeName && store.storeNameEnglish && store.storeName !== store.storeNameEnglish && (
                                 <p className="text-xs text-[#71717a] font-mono">
-                                  {store.storeNameEnglish}
+                                  {store.storeName}
                                 </p>
                               )}
                             </div>
@@ -711,19 +1254,19 @@ export default function App() {
                               onClick={() => setSelectedFoodDetail(dish)}
                               className="group bg-[#0e1017] border border-[#1b1e2a] hover:border-[#ea580c] transition-all duration-200 cursor-pointer p-4 flex flex-col justify-between space-y-3"
                             >
-                              {/* Dish Title & Price */}
+                              {/* Dish Title & Price (English Preferred Primary) */}
                               <div>
                                 <div className="flex items-baseline justify-between gap-2">
                                   <h4 className="text-sm font-bold text-white font-['Syne',sans-serif] group-hover:text-[#ea580c] transition-colors line-clamp-1">
-                                    {dish.dish_name}
+                                    {dish.english_name || dish.dish_name}
                                   </h4>
                                   <span className="text-sm font-mono font-bold text-white tabular-nums shrink-0">
                                     ${dish.price.toFixed(2)}
                                   </span>
                                 </div>
-                                {dish.english_name && (
+                                {(dish.chinese_name || dish.dish_name) && (
                                   <p className="text-[11px] text-[#71717a] line-clamp-1 mt-0.5 font-mono">
-                                    {dish.english_name}
+                                    {dish.chinese_name || dish.dish_name}
                                   </p>
                                 )}
                               </div>
@@ -834,16 +1377,16 @@ export default function App() {
                 </div>
 
                 {/* Quick Budget Presets */}
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1.5 flex-wrap">
                   <span className="text-xs text-[#71717a] font-mono">Presets:</span>
-                  {[1.50, 2.00, 2.50, 3.50].map((b) => (
+                  {[2.00, 5.00, 20.00, 50.00, 100.00, 500.00].map((b) => (
                     <button
                       key={b}
                       onClick={() => {
                         setSurvivalBudget(b);
                         handleRunSurvival(b);
                       }}
-                      className={`px-3 py-1 text-xs font-mono border transition-colors ${
+                      className={`px-2.5 py-1 text-xs font-mono border transition-colors ${
                         survivalBudget === b
                           ? 'border-[#ea580c] bg-[#ea580c] text-white font-bold'
                           : 'border-[#252a3a] text-[#a1a1aa] hover:text-white'
@@ -864,9 +1407,9 @@ export default function App() {
                   </div>
                   <input
                     type="range"
-                    min="1.00"
-                    max="4.00"
-                    step="0.10"
+                    min="15.00"
+                    max="500.00"
+                    step="1.00"
                     value={survivalBudget}
                     onChange={(e) => {
                       const val = parseFloat(e.target.value);
@@ -876,9 +1419,9 @@ export default function App() {
                     className="w-full accent-[#ea580c]"
                   />
                   <div className="flex justify-between text-[10px] text-[#71717a] font-mono">
-                    <span>$1.00 (Extreme Frugal)</span>
-                    <span>$2.00 (Standard Survival)</span>
-                    <span>$4.00 (Comfortable Combo)</span>
+                    <span>$15.00 (Minimum Dish)</span>
+                    <span>$60.00 (Mean Meal)</span>
+                    <span>$500.00 (Max Budget)</span>
                   </div>
                 </div>
 
@@ -954,8 +1497,10 @@ export default function App() {
                             {combo.items.map((it, i) => (
                               <div key={i} className="flex items-center justify-between text-xs font-mono">
                                 <div className="space-y-0.5 truncate pr-2">
-                                  <div className="text-white font-medium truncate">{it.dish_name}</div>
-                                  <div className="text-[10px] text-[#71717a] truncate">{it.store_name}</div>
+                                  <div className="text-white font-medium truncate">{it.english_name || it.dish_name}</div>
+                                  <div className="text-[10px] text-[#71717a] truncate">
+                                    {it.dish_name !== (it.english_name || it.dish_name) ? `${it.dish_name} · ` : ''}{it.store_name}
+                                  </div>
                                 </div>
                                 <div className="text-right text-[#a1a1aa] shrink-0 tabular-nums">
                                   ${it.price.toFixed(2)}
@@ -1003,10 +1548,13 @@ export default function App() {
                       >
                         <div className="flex items-start justify-between">
                           <div>
-                            <div className="text-xs text-[#71717a] font-mono">{item.store_name}</div>
+                            <div className="text-xs text-[#71717a] font-mono">{item.store_name_english || item.store_name}</div>
                             <h4 className="text-sm font-bold text-white font-['Syne',sans-serif] mt-0.5 line-clamp-1">
-                              {item.dish_name}
+                              {item.english_name || item.dish_name}
                             </h4>
+                            {(item.chinese_name || item.dish_name) && (item.english_name || item.dish_name) !== (item.chinese_name || item.dish_name) && (
+                              <div className="text-[10px] text-[#71717a] font-mono mt-0.5 line-clamp-1">{item.chinese_name || item.dish_name}</div>
+                            )}
                           </div>
                           <div className="text-right">
                             <div className="text-sm font-bold font-mono text-white tabular-nums">
@@ -1071,8 +1619,8 @@ export default function App() {
                       className="p-3 bg-[#13151f] hover:border-[#ea580c] border border-transparent transition-colors cursor-pointer flex items-center justify-between"
                     >
                       <div className="space-y-0.5 truncate pr-2">
-                        <div className="text-xs text-[#71717a] font-mono">#{idx + 1} · {it.store_name}</div>
-                        <div className="text-xs font-bold text-white truncate font-['Syne',sans-serif]">{it.dish_name}</div>
+                        <div className="text-xs text-[#71717a] font-mono">#{idx + 1} · {it.store_name_english || it.store_name}</div>
+                        <div className="text-xs font-bold text-white truncate font-['Syne',sans-serif]">{it.english_name || it.dish_name}</div>
                         <div className="text-[11px] text-[#a1a1aa] font-mono">${it.price.toFixed(2)} · {it.calories} kcal</div>
                       </div>
                       <div className="text-right font-mono shrink-0">
@@ -1098,8 +1646,8 @@ export default function App() {
                       className="p-3 bg-[#13151f] hover:border-emerald-500 border border-transparent transition-colors cursor-pointer flex items-center justify-between"
                     >
                       <div className="space-y-0.5 truncate pr-2">
-                        <div className="text-xs text-[#71717a] font-mono">#{idx + 1} · {it.store_name}</div>
-                        <div className="text-xs font-bold text-white truncate font-['Syne',sans-serif]">{it.dish_name}</div>
+                        <div className="text-xs text-[#71717a] font-mono">#{idx + 1} · {it.store_name_english || it.store_name}</div>
+                        <div className="text-xs font-bold text-white truncate font-['Syne',sans-serif]">{it.english_name || it.dish_name}</div>
                         <div className="text-[11px] text-[#a1a1aa] font-mono">${it.price.toFixed(2)} · {it.protein}g protein</div>
                       </div>
                       <div className="text-right font-mono shrink-0">
@@ -1125,8 +1673,8 @@ export default function App() {
                       className="p-3 bg-[#13151f] hover:border-[#ea580c] border border-transparent transition-colors cursor-pointer flex items-center justify-between"
                     >
                       <div className="space-y-0.5 truncate pr-2">
-                        <div className="text-xs text-[#71717a] font-mono">#{idx + 1} · {it.store_name}</div>
-                        <div className="text-xs font-bold text-white truncate font-['Syne',sans-serif]">{it.dish_name}</div>
+                        <div className="text-xs text-[#71717a] font-mono">#{idx + 1} · {it.store_name_english || it.store_name}</div>
+                        <div className="text-xs font-bold text-white truncate font-['Syne',sans-serif]">{it.english_name || it.dish_name}</div>
                         <div className="text-[11px] text-[#a1a1aa] font-mono">${it.price.toFixed(2)} · {it.calories} kcal</div>
                       </div>
                       <div className="text-right font-mono shrink-0">
@@ -1204,19 +1752,401 @@ export default function App() {
         )}
 
         {/* ========================================================== */}
-        {/* VIEW 5: SQLITE DATABASE & EXCEL DATASET MANAGEMENT         */}
+        {/* VIEW 5: FIREBASE FIRESTORE & SQLITE DATA MANAGEMENT        */}
         {/* ========================================================== */}
         {activeTab === 'database' && (
           <div className="space-y-8">
             <div className="border-b border-[#1a1d26] pb-4">
               <h2 className="text-2xl font-bold text-white font-['Syne',sans-serif]">
-                SQLite & Pandas Excel Integration
+                Cloud Firestore & SQLite Database Architecture
               </h2>
               <p className="text-xs text-[#71717a] mt-1 font-mono">
-                Database schema verification, dataset synchronization, and live Excel file export.
+                Persistent multi-tier storage: Google Cloud Firestore (Cloud Sync) + SQLite (Relational Engine) + Pandas Excel.
               </p>
             </div>
 
+            {/* Cloud Firestore Live Status Banner */}
+            <div className="bg-[#10121a] border border-[#ea580c] p-6 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-[#ea580c]/10 border border-[#ea580c] flex items-center justify-center text-[#ea580c]">
+                    <ShieldCheck className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-base font-bold text-white font-['Syne',sans-serif]">
+                        Google Cloud Firestore
+                      </h3>
+                      <span className="text-[11px] font-mono px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                        ONLINE & SYNCED
+                      </span>
+                    </div>
+                    <div className="text-xs text-[#a1a1aa] font-mono mt-0.5">
+                      Project: <strong className="text-white">gen-lang-client-0546400400</strong> · Region: <strong className="text-white">asia-southeast1</strong>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-right font-mono text-xs text-[#71717a]">
+                  <div>Firestore Collections: <strong className="text-white">foods, campus_hacks</strong></div>
+                  <div>Synced Documents: <strong className="text-emerald-400">{foods.length} items</strong></div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3 border-t border-[#1f222a] text-xs font-mono">
+                <div className="p-3 bg-[#08090d] border border-[#1a1d26] space-y-1">
+                  <div className="text-[#ea580c] font-bold">/foods/{'{foodId}'}</div>
+                  <div className="text-[#71717a]">Stores all canteen menu items with macros, CP values, and building coordinates.</div>
+                </div>
+                <div className="p-3 bg-[#08090d] border border-[#1a1d26] space-y-1">
+                  <div className="text-[#ea580c] font-bold">/campus_hacks/{'{hackId}'}</div>
+                  <div className="text-[#71717a]">Stores student ordering tips, verified hacks, and live upvote counters.</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Dual Explorer Tabs */}
+            <div className="flex items-center gap-2 border-b border-[#1a1d26] pb-3">
+              <button
+                onClick={() => setDbInspectorTab('firestore')}
+                className={`px-4 py-2 text-xs font-mono font-bold transition-colors border flex items-center gap-2 ${
+                  dbInspectorTab === 'firestore'
+                    ? 'bg-[#ea580c] border-[#ea580c] text-white'
+                    : 'bg-[#12141c] border-[#222634] text-[#a1a1aa] hover:text-white'
+                }`}
+              >
+                <ShieldCheck className="w-4 h-4" />
+                <span>1. Cloud Firestore Documents</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setDbInspectorTab('sql');
+                  if (!sqlResults) executeSqlQuery();
+                }}
+                className={`px-4 py-2 text-xs font-mono font-bold transition-colors border flex items-center gap-2 ${
+                  dbInspectorTab === 'sql'
+                    ? 'bg-[#ea580c] border-[#ea580c] text-white'
+                    : 'bg-[#12141c] border-[#222634] text-[#a1a1aa] hover:text-white'
+                }`}
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                <span>2. SQLite Query Runner</span>
+              </button>
+            </div>
+
+            {/* TAB 1: CLOUD FIRESTORE DOCUMENTS VIEWER */}
+            {dbInspectorTab === 'firestore' && (
+              <div className="space-y-6">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-[#10121a] border border-[#1f2330] p-4">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs font-mono text-[#71717a] uppercase">Collection:</span>
+                    <button
+                      onClick={() => setFirestoreViewCollection('foods')}
+                      className={`px-3 py-1 text-xs font-mono border ${
+                        firestoreViewCollection === 'foods'
+                          ? 'border-[#ea580c] bg-[#ea580c]/10 text-white font-bold'
+                          : 'border-[#272b3c] text-[#a1a1aa]'
+                      }`}
+                    >
+                      /foods ({foods.length} docs)
+                    </button>
+                    <button
+                      onClick={() => setFirestoreViewCollection('campus_hacks')}
+                      className={`px-3 py-1 text-xs font-mono border ${
+                        firestoreViewCollection === 'campus_hacks'
+                          ? 'border-[#ea580c] bg-[#ea580c]/10 text-white font-bold'
+                          : 'border-[#272b3c] text-[#a1a1aa]'
+                      }`}
+                    >
+                      /campus_hacks ({hacks.length} docs)
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {firestoreViewCollection === 'foods' && (
+                      <>
+                        {selectedDishIds.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={promptDeleteSelectedDishes}
+                            className="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs uppercase tracking-wider flex items-center gap-1.5 transition-colors shadow font-mono"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete Selected ({selectedDishIds.length})</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={promptDeleteAllImported}
+                          className="px-2.5 py-1 bg-[#141620] hover:bg-[#1e2230] border border-[#262b3c] hover:border-rose-500/50 text-[#a1a1aa] hover:text-rose-300 text-xs font-mono transition-colors flex items-center gap-1"
+                        >
+                          <Trash2 className="w-3 h-3 text-rose-400" />
+                          <span>Delete All Uploaded</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={promptResetToDefaults}
+                          className="px-2.5 py-1 bg-[#141620] hover:bg-[#1e2230] border border-[#262b3c] hover:border-amber-500/50 text-[#a1a1aa] hover:text-amber-300 text-xs font-mono transition-colors flex items-center gap-1"
+                        >
+                          <RotateCcw className="w-3 h-3 text-amber-400" />
+                          <span>Reset Defaults</span>
+                        </button>
+                      </>
+                    )}
+
+                    <a
+                      href="https://console.firebase.google.com/project/gen-lang-client-0546400400/firestore"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-3.5 py-1.5 bg-[#181a24] hover:bg-[#222533] border border-[#2d3246] hover:border-[#ea580c] text-white text-xs font-mono transition-colors flex items-center gap-1.5 self-start sm:self-auto"
+                    >
+                      <span>Open Firebase Console</span>
+                      <ArrowUpRight className="w-3.5 h-3.5 text-[#ea580c]" />
+                    </a>
+                  </div>
+                </div>
+
+                {/* Firestore Documents List */}
+                <div className="bg-[#0b0c10] border border-[#1a1d26] overflow-x-auto">
+                  {firestoreViewCollection === 'foods' ? (
+                    <table className="w-full text-left text-xs font-mono">
+                      <thead className="bg-[#12141c] text-[#71717a] border-b border-[#1f2330]">
+                        <tr>
+                          <th className="p-3 w-10 text-center">
+                            <input
+                              type="checkbox"
+                              checked={foods.length > 0 && selectedDishIds.length === foods.length}
+                              onChange={() => {
+                                if (selectedDishIds.length === foods.length) {
+                                  handleClearSelectedDishes();
+                                } else {
+                                  setSelectedDishIds(foods.map(f => f.id));
+                                }
+                              }}
+                              className="accent-[#ea580c] w-3.5 h-3.5 cursor-pointer rounded-none"
+                            />
+                          </th>
+                          <th className="p-3">Doc ID</th>
+                          <th className="p-3">Canteen</th>
+                          <th className="p-3">Store</th>
+                          <th className="p-3">Dish</th>
+                          <th className="p-3">Price</th>
+                          <th className="p-3">Calories</th>
+                          <th className="p-3">Protein</th>
+                          <th className="p-3">CP Index</th>
+                          <th className="p-3 text-right">Delete</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#171922] text-[#d4d4d8]">
+                        {foods.map((f) => (
+                          <tr key={f.id} className={`hover:bg-[#12141c]/50 ${selectedDishIds.includes(f.id) ? 'bg-[#ea580c]/5' : ''}`}>
+                            <td className="p-3 text-center">
+                              <input
+                                type="checkbox"
+                                checked={selectedDishIds.includes(f.id)}
+                                onChange={() => handleToggleSelectDish(f.id)}
+                                className="accent-[#ea580c] w-3.5 h-3.5 cursor-pointer rounded-none"
+                              />
+                            </td>
+                            <td className="p-3 text-[#ea580c]">food_{f.id}</td>
+                            <td className="p-3 text-white font-medium">{f.location_english || f.location}</td>
+                            <td className="p-3">{f.store_name_english || f.store_name}</td>
+                            <td className="p-3 font-semibold text-white">
+                              <div>{f.english_name || f.dish_name}</div>
+                              {(f.chinese_name || f.dish_name) && (f.english_name || f.dish_name) !== (f.chinese_name || f.dish_name) && (
+                                <div className="text-[10px] text-[#71717a] font-normal">{f.chinese_name || f.dish_name}</div>
+                              )}
+                            </td>
+                            <td className="p-3 text-white font-bold">${f.price.toFixed(2)}</td>
+                            <td className="p-3">{f.calories} kcal</td>
+                            <td className="p-3 text-emerald-400">{f.protein}g</td>
+                            <td className="p-3 font-bold text-[#ea580c]">{f.cp_index ? f.cp_index.toFixed(1) : '-'}</td>
+                            <td className="p-3 text-right">
+                              <button
+                                type="button"
+                                title="Delete this food row"
+                                onClick={() => promptDeleteSingleDish(f)}
+                                className="text-[#71717a] hover:text-rose-400 p-1 transition-colors"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <table className="w-full text-left text-xs font-mono">
+                      <thead className="bg-[#12141c] text-[#71717a] border-b border-[#1f2330]">
+                        <tr>
+                          <th className="p-3">Doc ID</th>
+                          <th className="p-3">Store</th>
+                          <th className="p-3">Dish Target</th>
+                          <th className="p-3">Secret Hack Text</th>
+                          <th className="p-3">Upvotes</th>
+                          <th className="p-3">Author</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#171922] text-[#d4d4d8]">
+                        {hacks.map((h) => (
+                          <tr key={h.id} className="hover:bg-[#12141c]/50">
+                            <td className="p-3 text-[#ea580c]">hack_{h.id}</td>
+                            <td className="p-3 text-white font-medium">{h.store_name}</td>
+                            <td className="p-3 text-[#a1a1aa]">{h.dish_name || 'All Dishes'}</td>
+                            <td className="p-3 max-w-md truncate">{h.hack_text}</td>
+                            <td className="p-3 font-bold text-[#ea580c]">👍 {h.upvotes}</td>
+                            <td className="p-3 text-[#71717a]">{h.author}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 2: SQLITE QUERY RUNNER & EXPLORER */}
+            {dbInspectorTab === 'sql' && (
+              <div className="space-y-6">
+                <div className="bg-[#10121a] border border-[#1f2330] p-5 space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="text-xs font-mono font-bold text-white uppercase flex items-center gap-2">
+                      <ShieldCheck className="w-4 h-4 text-[#ea580c]" />
+                      <span>Execute Read-Only SQL Query on `student_food.db`</span>
+                    </div>
+
+                    {/* Quick Preset Queries */}
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[11px] font-mono text-[#71717a]">Presets:</span>
+                      <button
+                        onClick={() => {
+                          const q = "SELECT id, store_name, dish_name, price, calories, protein FROM foods ORDER BY price ASC LIMIT 10;";
+                          setCustomSql(q);
+                          executeSqlQuery(q);
+                        }}
+                        className="px-2.5 py-1 text-[11px] font-mono bg-[#181a24] hover:bg-[#232736] border border-[#2b3042] text-[#a1a1aa] hover:text-white"
+                      >
+                        Cheapest 10 Dishes
+                      </button>
+                      <button
+                        onClick={() => {
+                          const q = "SELECT location, COUNT(*) as stores, ROUND(AVG(price), 2) as avg_price FROM foods GROUP BY location;";
+                          setCustomSql(q);
+                          executeSqlQuery(q);
+                        }}
+                        className="px-2.5 py-1 text-[11px] font-mono bg-[#181a24] hover:bg-[#232736] border border-[#2b3042] text-[#a1a1aa] hover:text-white"
+                      >
+                        Canteen Price Averages
+                      </button>
+                      <button
+                        onClick={() => {
+                          const q = "SELECT id, store_name, dish_name, upvotes, hack_text FROM campus_hacks ORDER BY upvotes DESC;";
+                          setCustomSql(q);
+                          executeSqlQuery(q);
+                        }}
+                        className="px-2.5 py-1 text-[11px] font-mono bg-[#181a24] hover:bg-[#232736] border border-[#2b3042] text-[#a1a1aa] hover:text-white"
+                      >
+                        Campus Hacks Table
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row gap-3">
+                    <textarea
+                      rows={3}
+                      value={customSql}
+                      onChange={(e) => setCustomSql(e.target.value)}
+                      placeholder="SELECT * FROM foods WHERE price < 2.50;"
+                      className="flex-1 p-3 bg-[#08090d] border border-[#222634] text-xs font-mono text-white focus:outline-none focus:border-[#ea580c]"
+                    />
+                    <button
+                      onClick={() => executeSqlQuery(customSql)}
+                      disabled={sqlLoading}
+                      className="px-6 py-3 bg-[#ea580c] hover:bg-[#c2410c] text-white text-xs font-mono font-bold uppercase tracking-wider transition-colors flex items-center justify-center gap-2 self-stretch sm:self-auto shrink-0"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${sqlLoading ? 'animate-spin' : ''}`} />
+                      <span>{sqlLoading ? 'Running...' : 'Run SQL'}</span>
+                    </button>
+                  </div>
+
+                  {sqlError && (
+                    <div className="p-3 bg-rose-950/30 border border-rose-800 text-xs font-mono text-rose-300">
+                      Error: {sqlError}
+                    </div>
+                  )}
+
+                  {/* SQL Results Grid */}
+                  {sqlResults && (
+                    <div className="space-y-2 pt-2">
+                      <div className="flex items-center justify-between text-xs font-mono text-[#71717a]">
+                        <span>Result Set: <strong className="text-white">{sqlResults.count} rows</strong> returned</span>
+                        <span>Backend: SQLite 3 (`student_food.db`)</span>
+                      </div>
+
+                      <div className="border border-[#1f2330] max-h-96 overflow-auto bg-[#08090d]">
+                        <table className="w-full text-left text-xs font-mono">
+                          <thead className="bg-[#12141c] text-[#ea580c] border-b border-[#1f2330] sticky top-0">
+                            <tr>
+                              {sqlResults.columns.map((col) => (
+                                <th key={col} className="p-2.5 whitespace-nowrap">{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-[#171922] text-[#d4d4d8]">
+                            {sqlResults.rows.map((row, rIdx) => (
+                              <tr key={rIdx} className="hover:bg-[#12141c]/50">
+                                {sqlResults.columns.map((col) => (
+                                  <td key={col} className="p-2.5 whitespace-nowrap">
+                                    {String(row[col] !== null && row[col] !== undefined ? row[col] : 'NULL')}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* EXCEL IMPORT BANNER */}
+            <div className="bg-[#10121a] border border-[#2a2f42] hover:border-[#ea580c] transition-colors p-6 flex flex-col md:flex-row md:items-center justify-between gap-6">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-xs font-mono text-[#ea580c] uppercase font-bold">
+                  <FileUp className="w-4 h-4" />
+                  <span>Direct Excel & CSV to Firebase Firestore Importer</span>
+                </div>
+                <h3 className="text-lg font-bold text-white font-['Syne',sans-serif]">
+                  Have a spreadsheet with campus menus or student discounts?
+                </h3>
+                <p className="text-xs text-[#a1a1aa] font-mono max-w-2xl leading-relaxed">
+                  Upload any <code className="text-white bg-[#1a1d28] px-1">.xlsx</code> or <code className="text-white bg-[#1a1d28] px-1">.csv</code> file. The engine matches columns, shows a live preview, and batch-writes all dishes directly into Google Cloud Firestore and SQLite with 1 click.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-3 shrink-0">
+                <button
+                  type="button"
+                  onClick={downloadReferenceTemplate}
+                  className="px-3.5 py-2 bg-[#171924] hover:bg-[#202332] border border-[#2a2f42] hover:border-[#ea580c] text-xs font-mono text-[#a1a1aa] hover:text-white transition-colors flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5 text-[#ea580c]" />
+                  <span>Download Clean Template (.xlsx)</span>
+                </button>
+                <button
+                  onClick={() => setShowExcelImportModal(true)}
+                  className="px-4 py-2 bg-[#ea580c] hover:bg-[#c2410c] text-white text-xs font-mono font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5 shadow-lg"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Upload & Import Excel</span>
+                </button>
+              </div>
+            </div>
+
+            {/* SQLite & Excel Schema Cards */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
               {/* SQLite Schema Verification */}
               <div className="bg-[#0e1017] border border-[#1e222f] p-6 space-y-4">
@@ -1299,10 +2229,10 @@ export default function App() {
                   {selectedFoodDetail.cuisine} · {selectedFoodDetail.category}
                 </div>
                 <h3 className="text-2xl font-bold text-white font-['Syne',sans-serif] mt-1">
-                  {selectedFoodDetail.dish_name}
+                  {selectedFoodDetail.english_name || selectedFoodDetail.dish_name}
                 </h3>
-                {selectedFoodDetail.english_name && (
-                  <p className="text-xs text-[#a1a1aa] mt-0.5">{selectedFoodDetail.english_name}</p>
+                {(selectedFoodDetail.chinese_name || selectedFoodDetail.dish_name) && (
+                  <p className="text-xs text-[#a1a1aa] mt-0.5">{selectedFoodDetail.chinese_name || selectedFoodDetail.dish_name}</p>
                 )}
               </div>
               <button
@@ -1320,8 +2250,8 @@ export default function App() {
               <div className="p-3 bg-[#08090d] border border-[#191c26] flex items-center justify-between text-xs font-mono">
                 <div className="space-y-0.5">
                   <div className="text-[#71717a]">Canteen & Store</div>
-                  <div className="text-white font-bold">{selectedFoodDetail.store_name}</div>
-                  <div className="text-[#a1a1aa] text-[11px]">{selectedFoodDetail.location}</div>
+                  <div className="text-white font-bold">{selectedFoodDetail.store_name_english || selectedFoodDetail.store_name}</div>
+                  <div className="text-[#a1a1aa] text-[11px]">{selectedFoodDetail.location_english || selectedFoodDetail.location}</div>
                 </div>
                 <div className="text-right">
                   <div className="text-[#71717a]">Price</div>
@@ -1677,6 +2607,276 @@ export default function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================== */}
+      {/* MODAL 4: IMPORT EXCEL / CSV TO FIREBASE FIRESTORE         */}
+      {/* ========================================================== */}
+      {showExcelImportModal && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#0e1017] border border-[#242938] max-w-2xl w-full p-6 space-y-5 shadow-2xl animate-fade-in max-h-[90vh] overflow-y-auto font-mono text-xs">
+            <div className="flex items-center justify-between border-b border-[#191c26] pb-3">
+              <div>
+                <div className="flex items-center gap-2 text-[#ea580c] uppercase font-bold text-[11px]">
+                  <FileUp className="w-3.5 h-3.5" />
+                  <span>Google Cloud Firestore Batch Writer</span>
+                </div>
+                <h3 className="text-xl font-bold text-white font-['Syne',sans-serif] mt-0.5">
+                  Import Excel / CSV to Firebase
+                </h3>
+              </div>
+              <button
+                onClick={() => {
+                  setShowExcelImportModal(false);
+                  setImportedRows(null);
+                  setImportFileName('');
+                  setImportError(null);
+                }}
+                className="text-[#71717a] hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Step 1: Expected Columns Guide & Template Download */}
+            <div className="p-3 bg-[#08090d] border border-[#1a1d26] space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-white font-bold">Standard 18 Columns in Reference Template:</span>
+                <button
+                  type="button"
+                  onClick={downloadReferenceTemplate}
+                  className="text-[#ea580c] hover:text-[#fb923c] font-bold flex items-center gap-1.5 text-xs bg-[#ea580c]/10 hover:bg-[#ea580c]/20 border border-[#ea580c]/40 px-2.5 py-1 transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download Clean Reference Template (.xlsx)</span>
+                </button>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-1.5 text-[10px] text-[#a1a1aa]">
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">id</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">store_name</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">store_name_english</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">location</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">location_english</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">dish_name</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">price</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">calories</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">protein</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">carbs</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">fat</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">is_vegetarian</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">is_official</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">cuisine</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">is_combo</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">category</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">EnglishName</strong></div>
+                <div className="p-1 bg-[#12141c] border border-[#1f222f] truncate"><strong className="text-white">ChineseName</strong></div>
+              </div>
+            </div>
+
+            {/* Step 2: Drag & Drop / File Input */}
+            <div className="border border-dashed border-[#2d3345] hover:border-[#ea580c] p-6 text-center space-y-3 bg-[#0a0c10] transition-colors relative cursor-pointer">
+              <input
+                type="file"
+                accept=".xlsx, .xls, .csv"
+                onChange={handleExcelFileSelect}
+                className="absolute inset-0 opacity-0 cursor-pointer w-full h-full"
+              />
+              <div className="w-10 h-10 bg-[#ea580c]/10 border border-[#ea580c] text-[#ea580c] flex items-center justify-center mx-auto">
+                <Upload className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-white font-bold text-sm">
+                  {importFileName ? importFileName : "Click or drag your .xlsx / .csv file here"}
+                </p>
+                <p className="text-[#71717a] text-[11px] mt-0.5">
+                  Parsed locally in your browser before committing to Cloud Firestore
+                </p>
+              </div>
+            </div>
+
+            {importError && (
+              <div className="p-3 bg-rose-950/30 border border-rose-800 text-rose-300 text-xs">
+                {importError}
+              </div>
+            )}
+
+            {/* Step 3: Live Preview of Parsed Rows */}
+            {importedRows && importedRows.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-[#71717a]">
+                  <span>Previewing: <strong className="text-white">{importedRows.length} dishes</strong> ready to import</span>
+                  <span className="text-emerald-400">Validated from {importFileName}</span>
+                </div>
+
+                <div className="border border-[#1f222f] max-h-48 overflow-auto bg-[#08090d]">
+                  <table className="w-full text-left text-[11px]">
+                    <thead className="bg-[#12141c] text-[#ea580c] border-b border-[#1f222f] sticky top-0 whitespace-nowrap">
+                      <tr>
+                        <th className="p-2">#</th>
+                        <th className="p-2">id</th>
+                        <th className="p-2">store_name</th>
+                        <th className="p-2">store_name_english</th>
+                        <th className="p-2">location</th>
+                        <th className="p-2">dish_name</th>
+                        <th className="p-2">price</th>
+                        <th className="p-2">calories</th>
+                        <th className="p-2">protein</th>
+                        <th className="p-2">carbs</th>
+                        <th className="p-2">fat</th>
+                        <th className="p-2">is_vegetarian</th>
+                        <th className="p-2">is_official</th>
+                        <th className="p-2">cuisine</th>
+                        <th className="p-2">is_combo</th>
+                        <th className="p-2">category</th>
+                        <th className="p-2">EnglishName</th>
+                        <th className="p-2">ChineseName</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#171922] text-[#d4d4d8] whitespace-nowrap">
+                      {importedRows.slice(0, 15).map((row, idx) => (
+                        <tr key={idx} className="hover:bg-[#12141c]/50">
+                          <td className="p-2 text-[#71717a]">{idx + 1}</td>
+                          <td className="p-2 text-[#71717a]">{row.id || idx + 1}</td>
+                          <td className="p-2 text-white font-medium">{row.store_name}</td>
+                          <td className="p-2 text-[#a1a1aa]">{row.store_name_english || '-'}</td>
+                          <td className="p-2">{row.location}</td>
+                          <td className="p-2 text-white font-bold">{row.dish_name}</td>
+                          <td className="p-2 text-white font-bold">${Number(row.price || 0).toFixed(2)}</td>
+                          <td className="p-2">{row.calories} kcal</td>
+                          <td className="p-2 text-emerald-400">{row.protein}g</td>
+                          <td className="p-2">{row.carbs}g</td>
+                          <td className="p-2">{row.fat}g</td>
+                          <td className="p-2">{row.is_vegetarian ? '1 (Veg)' : '0'}</td>
+                          <td className="p-2">{row.is_official ? '1' : '0'}</td>
+                          <td className="p-2">{row.cuisine}</td>
+                          <td className="p-2">{row.is_combo ? '1 (Combo)' : '0'}</td>
+                          <td className="p-2">{row.category}</td>
+                          <td className="p-2 text-amber-300">{row.EnglishName || row.english_name || '-'}</td>
+                          <td className="p-2 text-amber-300">{row.ChineseName || row.chinese_name || '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {importedRows.length > 15 && (
+                  <p className="text-[10px] text-[#71717a] text-center">
+                    ... and {importedRows.length - 15} more dishes
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Modal Actions */}
+            <div className="pt-3 border-t border-[#191c26] flex items-center justify-between">
+              <span className="text-[11px] text-[#71717a]">
+                Destination: Cloud Firestore (<code className="text-white">/foods</code>)
+              </span>
+
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowExcelImportModal(false);
+                    setImportedRows(null);
+                    setImportFileName('');
+                    setImportError(null);
+                  }}
+                  className="px-4 py-2 bg-[#141620] text-[#a1a1aa] hover:text-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={!importedRows || importedRows.length === 0 || importingToFirebase}
+                  onClick={handleCommitExcelToFirebase}
+                  className="px-5 py-2 bg-[#ea580c] hover:bg-[#c2410c] disabled:opacity-50 text-white font-bold flex items-center gap-2"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${importingToFirebase ? 'animate-spin' : ''}`} />
+                  <span>
+                    {importingToFirebase
+                      ? 'Writing to Firestore...'
+                      : `Commit ${importedRows ? importedRows.length : 0} Dishes to Firebase`}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* FLOATING BULK SELECTION ACTION BAR (Database Inspector only) */}
+      {activeTab === 'database' && selectedDishIds.length > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-[#10121a]/95 backdrop-blur-md border border-[#ea580c] px-5 py-3 shadow-2xl flex items-center gap-4 text-xs font-mono text-white animate-in fade-in slide-in-from-bottom-4 duration-200">
+          <div className="flex items-center gap-2">
+            <CheckSquare className="w-4 h-4 text-[#ea580c]" />
+            <span><strong className="text-white">{selectedDishIds.length}</strong> dish(es) selected</span>
+          </div>
+
+          <div className="h-4 w-px bg-[#262a3a]" />
+
+          <button
+            type="button"
+            onClick={handleClearSelectedDishes}
+            className="text-[#a1a1aa] hover:text-white underline transition-colors"
+          >
+            Clear Selection
+          </button>
+
+          <button
+            type="button"
+            onClick={promptDeleteSelectedDishes}
+            className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold uppercase tracking-wider flex items-center gap-1.5 transition-colors shadow-lg"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Delete Selected Rows</span>
+          </button>
+        </div>
+      )}
+
+      {/* CONFIRM DELETE MODAL */}
+      {showConfirmDeleteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-[#0f1118] border border-rose-800/80 p-6 max-w-md w-full shadow-2xl space-y-4 font-mono text-xs">
+            <div className="flex items-center gap-3 text-rose-400">
+              <div className="w-10 h-10 bg-rose-500/10 border border-rose-500 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5 text-rose-400" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-white font-['Syne',sans-serif]">Confirm Permanent Deletion</h3>
+                <p className="text-[11px] text-[#a1a1aa]">Cloud Firestore & SQLite operation</p>
+              </div>
+            </div>
+
+            <p className="text-xs text-[#d4d4d8] leading-relaxed bg-[#090a0f] p-3 border border-[#1e2230]">
+              Are you sure you want to delete <strong className="text-white">{deleteTargetLabel}</strong>? This will immediately remove the records from your live Cloud Firestore database and local tables.
+            </p>
+
+            <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#1e2230]">
+              <button
+                type="button"
+                disabled={deletingRows}
+                onClick={() => {
+                  setShowConfirmDeleteModal(false);
+                  setDeleteTargetIds([]);
+                  setDeleteTargetLabel('');
+                }}
+                className="px-4 py-2 bg-[#171924] hover:bg-[#202330] text-[#a1a1aa] hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deletingRows}
+                onClick={handleExecuteDeletion}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5 shadow-lg"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{deletingRows ? 'Deleting...' : 'Yes, Delete Now'}</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

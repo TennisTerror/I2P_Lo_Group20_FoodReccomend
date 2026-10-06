@@ -1,0 +1,109 @@
+{
+  "entities": {
+    "Food": {
+      "title": "Food",
+      "description": "Campus food item with nutritional and location metadata",
+      "type": "object",
+      "properties": {
+        "store_name": {
+          "type": "string",
+          "description": "Name of campus eatery"
+        },
+        "store_name_english": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string",
+          "description": "Canteen name or campus building"
+        },
+        "location_english": {
+          "type": "string"
+        },
+        "dish_name": {
+          "type": "string",
+          "description": "Dish title"
+        },
+        "price": {
+          "type": "number",
+          "description": "Cost in local currency"
+        },
+        "calories": {
+          "type": "number"
+        },
+        "protein": {
+          "type": "number"
+        },
+        "carbs": {
+          "type": "number"
+        },
+        "fat": {
+          "type": "number"
+        },
+        "is_vegetarian": {
+          "type": "boolean"
+        },
+        "is_official": {
+          "type": "boolean"
+        },
+        "cuisine": {
+          "type": "string"
+        },
+        "is_combo": {
+          "type": "boolean"
+        },
+        "category": {
+          "type": "string"
+        },
+        "english_name": {
+          "type": "string"
+        },
+        "chinese_name": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        }
+      },
+      "required": ["store_name", "location", "dish_name", "price", "calories"]
+    },
+    "CampusHack": {
+      "title": "CampusHack",
+      "description": "Secret student portion tips and ordering hacks",
+      "type": "object",
+      "properties": {
+        "store_name": {
+          "type": "string"
+        },
+        "dish_name": {
+          "type": "string"
+        },
+        "hack_text": {
+          "type": "string"
+        },
+        "upvotes": {
+          "type": "number"
+        },
+        "author": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        }
+      },
+      "required": ["store_name", "hack_text", "upvotes"]
+    }
+  },
+  "firestore": {
+    "/foods/{foodId}": {
+      "schema": "Food",
+      "description": "Collection of student food items organized by ID"
+    },
+    "/campus_hacks/{hackId}": {
+      "schema": "CampusHack",
+      "description": "Community crowdsourced campus food hacks"
+    }
+  }
+}

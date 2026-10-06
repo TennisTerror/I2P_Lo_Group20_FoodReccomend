@@ -820,6 +820,60 @@ def add_food(food: FoodCreate):
     return {"message": "Food added successfully", "id": new_id}
 
 
+class BatchFoodImport(BaseModel):
+    items: List[Dict[str, Any]]
+
+
+@app.post("/api/foods/batch-import")
+def batch_import_foods(batch: BatchFoodImport):
+    conn = get_db()
+    cursor = conn.cursor()
+    imported_count = 0
+    for item in batch.items:
+        store_name = item.get("store_name") or item.get("Store Name") or item.get("Store") or item.get("餐廳") or "Campus Eatery"
+        store_eng = item.get("store_name_english") or item.get("Store English") or store_name
+        location = item.get("location") or item.get("Location") or item.get("Canteen") or item.get("地點") or "Campus Concourse"
+        location_eng = item.get("location_english") or location
+        dish_name = item.get("dish_name") or item.get("Dish Name") or item.get("Dish") or item.get("菜名") or "Campus Dish"
+        price = float(item.get("price") or item.get("Price") or 2.0)
+        calories = float(item.get("calories") or item.get("Calories") or 500.0)
+        protein = float(item.get("protein") or item.get("Protein") or 20.0)
+        carbs = float(item.get("carbs") or item.get("Carbs") or 60.0)
+        fat = float(item.get("fat") or item.get("Fat") or 15.0)
+        is_veg = 1 if bool(item.get("is_vegetarian") or item.get("Vegetarian")) else 0
+        cuisine = item.get("cuisine") or item.get("Cuisine") or "Taiwanese"
+        category = item.get("category") or "Main"
+        english_name = item.get("english_name") or dish_name
+        chinese_name = item.get("chinese_name") or dish_name
+        tags = item.get("tags") or "Imported from Excel"
+
+        cursor.execute("""
+        INSERT INTO foods (
+            store_name, store_name_english, location, location_english,
+            dish_name, price, calories, protein, carbs, fat,
+            is_vegetarian, is_official, cuisine, is_combo, category,
+            english_name, chinese_name, tags, image_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?, ?, ?, NULL)
+        """, (
+            store_name, store_eng, location, location_eng,
+            dish_name, price, calories, protein, carbs, fat,
+            is_veg, cuisine, category, english_name, chinese_name, tags
+        ))
+        imported_count += 1
+
+    conn.commit()
+
+    # Sync to food_database.xlsx
+    try:
+        df = pd.read_sql_query("SELECT * FROM foods", conn)
+        df.to_excel(EXCEL_FILE, index=False, engine="openpyxl")
+    except Exception as e:
+        print(f"Warning: Excel sync error during batch: {e}")
+
+    conn.close()
+    return {"message": f"Successfully imported {imported_count} dishes", "count": imported_count}
+
+
 @app.put("/api/foods/{food_id}")
 def update_food(food_id: int, food: FoodCreate):
     """Updates an existing food item in SQLite."""
@@ -857,8 +911,52 @@ def delete_food(food_id: int):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM foods WHERE id = ?", (food_id,))
     conn.commit()
+
+    try:
+        df = pd.read_sql_query("SELECT * FROM foods", conn)
+        df.to_excel(EXCEL_FILE, index=False, engine="openpyxl")
+    except Exception as e:
+        print(f"Warning: Excel sync error: {e}")
+
     conn.close()
     return {"message": "Food deleted", "id": food_id}
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: List[Union[int, str]] = []
+
+
+@app.post("/api/foods/batch-delete")
+def batch_delete_foods(req: BatchDeleteRequest):
+    conn = get_db()
+    cursor = conn.cursor()
+    int_ids = []
+    for x in req.ids:
+        try:
+            int_ids.append(int(x))
+        except (ValueError, TypeError):
+            pass
+
+    if int_ids:
+        placeholders = ",".join("?" for _ in int_ids)
+        cursor.execute(f"DELETE FROM foods WHERE id IN ({placeholders})", int_ids)
+        conn.commit()
+
+    try:
+        df = pd.read_sql_query("SELECT * FROM foods", conn)
+        df.to_excel(EXCEL_FILE, index=False, engine="openpyxl")
+    except Exception as e:
+        print(f"Warning: Excel sync error during batch delete: {e}")
+
+    conn.close()
+    return {"message": f"Successfully deleted {len(int_ids)} foods", "count": len(int_ids)}
+
+
+@app.post("/api/foods/reset-defaults")
+def reset_foods_defaults():
+    init_db()
+    return {"message": "Database reset to 18 official campus items", "count": len(INITIAL_FOODS)}
+
 
 
 # ==========================================
@@ -1130,6 +1228,51 @@ def reset_and_seed_database():
     init_db()
     seed_database_and_excel()
     return {"message": "Database and Excel dataset reset & seeded successfully"}
+
+
+@app.get("/api/sql-tables")
+def get_sql_tables():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+    tables = [r[0] for r in cursor.fetchall()]
+    table_info = {}
+    for t in tables:
+        cursor.execute(f"PRAGMA table_info({t});")
+        cols = [dict(c) for c in cursor.fetchall()]
+        cursor.execute(f"SELECT COUNT(*) FROM {t};")
+        count = cursor.fetchone()[0]
+        cursor.execute(f"SELECT * FROM {t} LIMIT 10;")
+        rows = [dict(r) for r in cursor.fetchall()]
+        table_info[t] = {
+            "columns": cols,
+            "row_count": count,
+            "sample_rows": rows
+        }
+    conn.close()
+    return {"tables": tables, "details": table_info}
+
+
+class SqlQueryRequest(BaseModel):
+    query: str
+
+
+@app.post("/api/sql-run")
+def run_sql_query(req: SqlQueryRequest):
+    q = req.query.strip()
+    if not q.upper().startswith("SELECT"):
+        raise HTTPException(status_code=400, detail="Only SELECT queries are permitted in the read-only SQL explorer.")
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(q)
+        rows = [dict(r) for r in cursor.fetchall()]
+        cols = [description[0] for description in cursor.description] if cursor.description else []
+        conn.close()
+        return {"columns": cols, "rows": rows, "count": len(rows)}
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 if __name__ == "__main__":

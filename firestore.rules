@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for validating payloads
+    function isValidFood(data) {
+      return data.store_name is string && data.store_name.size() > 0 &&
+             data.location is string && data.location.size() > 0 &&
+             data.dish_name is string && data.dish_name.size() > 0 &&
+             data.price is number && data.price >= 0 &&
+             data.calories is number && data.calories >= 0;
+    }
+
+    function isValidHack(data) {
+      return data.store_name is string && data.store_name.size() > 0 &&
+             data.hack_text is string && data.hack_text.size() > 0 &&
+             data.upvotes is number && data.upvotes >= 0;
+    }
+
+    // Foods collection: readable by all campus students, writable with valid payload, and deletable
+    match /foods/{foodId} {
+      allow read: if true;
+      allow create: if isValidFood(request.resource.data);
+      allow update: if isValidFood(request.resource.data);
+      allow delete: if true;
+    }
+
+    // Campus hacks: readable by all, creatable, and allows upvote increments and deletion
+    match /campus_hacks/{hackId} {
+      allow read: if true;
+      allow create: if isValidHack(request.resource.data);
+      allow update: if isValidHack(request.resource.data);
+      allow delete: if true;
+    }
+
+    // Connection testing endpoint
+    match /test/{docId} {
+      allow read: if true;
+    }
+  }
+}
